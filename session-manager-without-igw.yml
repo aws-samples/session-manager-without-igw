@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Provides Session Manager access without an Internet Gateway to an instance in a private subnet.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Configuration
+        Parameters:
+          - pLatestAmiId
+          - pCidr
+          - pInstanceType
+    ParameterLabels:
+      pLatestAmiId:
+        default: Systems Manager Parameter for AMI
+      pCidr:
+        default: CIDR block for VPC and subnet
+      pInstanceType:
+        default: EC2 Instance Type
+Parameters:
+  # Systems Manager Parameter is used to find the latest Amazon Linux 2 AMI ID
+  # Amazon Linux 2 is preloaded with the SSM Agent
+  pLatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  pCidr:
+    Type: String
+    Default: 10.0.0.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+  pInstanceType:
+    Type: String
+    Default: t2.micro
+    Description: Select a valid instance type for your Region
+    AllowedValues:
+    # add instance types to this list as desired
+    - t2.micro
+    - t3.micro
+    - m4.large
+    - m5.large
+Resources:
+  rVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref pCidr
+      EnableDnsHostnames: True
+      EnableDnsSupport: True
+  # Three VPC endpoints are required for Session Manager without an internet gateway:
+  # 1. ssm
+  # 2. ssmmessages
+  # 3. ec2messages
+  # This solution will not work without in Regions that do not include all three 
+  # of these VPC endpoints
+  rSsmVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcId: !Ref rVpc
+      SubnetIds:
+        - !Ref rPrivateSubnet
+      SecurityGroupIds:
+        - !Ref rSecurityGroupVpcEndpoint
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: True
+  rSsmMessagesVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcId: !Ref rVpc
+      SubnetIds:
+        - !Ref rPrivateSubnet
+      SecurityGroupIds:
+        - !Ref rSecurityGroupVpcEndpoint
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: True
+  rEc2MessagesVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcId: !Ref rVpc
+      SubnetIds:
+        - !Ref rPrivateSubnet
+      SecurityGroupIds:
+        - !Ref rSecurityGroupVpcEndpoint
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: True
+  rEc2InstanceProfile: 
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Path: /
+      Roles: 
+        - !Ref rEc2InstanceRole
+  rEc2InstanceRole: 
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement: 
+          - 
+            Effect: Allow
+            Principal: 
+              Service: 
+                - ec2.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        # The managed IAM policy AmazonSSMManagedInstanceCore grants access to Session Manager
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+  rEc2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref pLatestAmiId
+      InstanceType: !Ref pInstanceType
+      SubnetId: !Ref rPrivateSubnet
+      IamInstanceProfile: !Ref rEc2InstanceProfile 
+      SecurityGroupIds:
+        - !Ref rSecurityGroupEc2Instance
+  rPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref pCidr
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref rVpc
+  rPrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref rVpc
+  rSecurityGroupEc2Instance:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for EC2 Instance
+      VpcId: !Ref rVpc
+      # Despite this security group containing no ingress rules, Session 
+      # Manager can still provide shell access 
+      SecurityGroupEgress:
+      # The SSM Agent connects to Session Manager over TCP 443
+      - Description: allow outbound HTTPS to the VPC
+        CidrIp: !Ref pCidr 
+        FromPort: 443
+        ToPort: 443
+        IpProtocol: tcp
+  rSecurityGroupVpcEndpoint:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for VPC Endpoints
+      VpcId: !Ref rVpc
+      SecurityGroupIngress:
+      # The SSM Agent connects to Session Manager over TCP 443
+      - Description: allow inbound HTTPS from the EC2 instance
+        SourceSecurityGroupId: !Ref rSecurityGroupEc2Instance
+        FromPort: 443
+        ToPort: 443
+        IpProtocol: tcp
+      SecurityGroupEgress:
+      # The SSM Agent connects to Session Manager over TCP 443
+      - Description: allow outbound HTTPS to the VPC
+        CidrIp: !Ref pCidr 
+        FromPort: 443
+        ToPort: 443
+        IpProtocol: tcp
+  rPrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref rPrivateRouteTable
+      SubnetId: !Ref rPrivateSubnet
